@@ -1,0 +1,7 @@
+bpy==5.3.0
+numpy
+opencv-python
+numba
+OpenEXR>=3.3
+scikit-image
+pillow

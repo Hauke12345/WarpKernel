@@ -1,38 +1,81 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Keyframe-warp renderer driver.
-python3 render.py <scene> sim  [thr] [split]   offline: uses the baseline renders as keyframes / residual pixels,
-                                               estimates the render cost from measured timings
-python3 render.py <scene> real [thr] [split]   real run, everything rendered and timed
+"""WarpKernel renderer.
+
+Any .blend file:
+    python3 render.py --blend scene.blend [--frames 1 120] [--out DIR] [--thr 0.08] [--split 0.3] [--spp N] [--scale 100]
+    -> DIR/frames/0001.png ... (scene colour management) + DIR/<name>.mp4 + DIR/summary.json
+
+The three test scenes (benchmark):
+    python3 render.py <interior|outdoor|marble> real [thr] [split] [tag]   real run, everything rendered and timed
+    python3 render.py <interior|outdoor|marble> sim  [thr] [split] [tag]   offline replay on an existing baseline
 
 Order (like a hierarchical GOP): render first + last frame as keyframes, then bisect. For an interval (a, b) we
 predict its midpoint; if more than `split` of the frame would need re-rendering, the midpoint becomes a keyframe and
 both halves are processed, otherwise every frame inside (a, b) is predicted from a and b and only its dirty
 rectangles are rendered."""
-import sys, os, time, json
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sys, os, time, json, argparse, subprocess
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+T0 = time.time()
+BLEND = "--blend" in sys.argv
+if BLEND:
+    ap = argparse.ArgumentParser(description="WarpKernel: codec-style frame reuse for Blender Cycles")
+    ap.add_argument("--blend", required=True)
+    ap.add_argument("--frames", nargs=2, type=int, help="first last (default: the scene's frame range)")
+    ap.add_argument("--out", help="output directory (default: out/<blend name>)")
+    ap.add_argument("--thr", type=float, default=0.08, help="disagreement threshold (display units, lower = stricter)")
+    ap.add_argument("--split", type=float, default=0.30, help="add a keyframe when more than this share of a midpoint is dirty")
+    ap.add_argument("--spp", type=int, help="samples per pixel (default: the file's own)")
+    ap.add_argument("--scale", type=int, help="resolution percentage (default: the file's own)")
+    ap.add_argument("--max-rot", type=float, default=45.0,
+                    help="add a keyframe when a visible moving object turns more than this many degrees between keyframes")
+    ap.add_argument("--no-video", action="store_true")
+    A = ap.parse_args()
+    import bpy
+    bpy.ops.wm.open_mainfile(filepath=os.path.abspath(A.blend))
+    _r = bpy.context.scene.render
+    _pct = A.scale or _r.resolution_percentage
+    os.environ["KF_W"] = str(_r.resolution_x * _pct // 100); os.environ["KF_H"] = str(_r.resolution_y * _pct // 100)
+
 import numpy as np
 import cv2
-from scenes import load, FRAMES, animated_objects, animated_materials, objects_using, W, H, ROOT
+from scenes import load, load_blend, FRAMES, animated_objects, animated_materials, objects_using, deforming_objects, W, H, ROOT
 from common import render_layer, read_layer, write_exr, read_rgb, read_gbuf, cam_matrix
 from warp import Key, predict, dirty_rects, reuse, RateModel, tm, PAD
 import intra
 
-which, mode = sys.argv[1], sys.argv[2]
-thr = float(sys.argv[3]) if len(sys.argv) > 3 else 0.05
-split = float(sys.argv[4]) if len(sys.argv) > 4 else 0.30
-tag = sys.argv[5] if len(sys.argv) > 5 else f"{mode}_t{thr}_s{split}"
+if BLEND:
+    which, mode, thr, split = os.path.splitext(os.path.basename(A.blend))[0], "real", A.thr, A.split
+    sc, WARN = load_blend(os.path.abspath(A.blend))
+    if A.spp:
+        sc.cycles.samples = A.spp
+    f0, f1 = A.frames if A.frames else (sc.frame_start, sc.frame_end)
+    out = os.path.abspath(A.out or os.path.join(os.path.dirname(HERE), "out", which))
+    MAX_ROT = A.max_rot or None
+    base = os.path.join(out, "_none")
+    for w_ in WARN:
+        print("WARNING:", w_, flush=True)
+else:
+    which, mode = sys.argv[1], sys.argv[2]
+    thr = float(sys.argv[3]) if len(sys.argv) > 3 else 0.05
+    split = float(sys.argv[4]) if len(sys.argv) > 4 else 0.30
+    WARN = []
+    MAX_ROT = float(os.environ.get("KF_MAX_ROT", "0")) or None     # off for the published benchmark runs
+    f0, f1 = FRAMES[which]
+    base = f"{ROOT}/{which}/base"
+    out = f"{ROOT}/{which}/{sys.argv[5] if len(sys.argv) > 5 else f'{mode}_t{thr}_s{split}'}"
+    sc = load(which)
 REAL = mode == "real"
-f0, f1 = FRAMES[which]
-base = f"{ROOT}/{which}/base"
-out = f"{ROOT}/{which}/{tag}"; os.makedirs(out, exist_ok=True)
+os.makedirs(out, exist_ok=True)
 tmp = f"{out}/_r.exr"
-
-T0 = time.time()
-sc = load(which)
 moving = animated_objects(sc, f0, f1)
 amats = animated_materials(sc, f0, f1)
 idx_of = {o.name: o.pass_index for o in sc.objects}
 mov_idx = {idx_of[n]: ms for n, ms in moving.items() if n != sc.camera.name}
+DEFORM = np.array([idx_of[n] for n in deforming_objects(sc, f0, f1)], np.int64)
+if len(DEFORM):
+    print(f"deforming objects (re-rendered every frame): {[o.name for o in sc.objects if o.pass_index in set(DEFORM.tolist())]}", flush=True)
 def glossy_objects(rough_max=0.3, coat_min=0.3, metal_min=0.5):
     """Scene knowledge: objects whose shading depends on the view (low roughness, metal, glass, transmission).
     glossy_objects(0.15, 2.0, 2.0) -> only mirror-like surfaces."""
@@ -64,15 +107,26 @@ if REAL:
     T_CALL += 0.03                                # frame change / read / feather bookkeeping per call
 else:
     T_CALL = {"interior": 0.045, "outdoor": 0.045, "marble": 0.17}[which]
-t_full_est = np.mean([x["beauty"] for x in json.load(open(f"{base}/timing.json"))["frames"]])
-os.environ["KF_OVERHEAD_TILES"] = str(T_CALL / t_full_est * (W * H) / 256)
-t_setup = time.time() - T0
-print(f"mirror objects {len(MIRROR)}"); print(f"setup {t_setup:.1f}s, call overhead {T_CALL:.3f}s = {os.environ['KF_OVERHEAD_TILES']} tiles, glossy objects {len(GLOSSY)}, moving objects {len(mov_idx)}, animated materials {list(amats)}", flush=True)
+HAVE_BASE = os.path.exists(f"{base}/timing.json")
 
-timing = json.load(open(f"{base}/timing.json"))
-T_FULL = np.mean([x["beauty"] for x in timing["frames"]])
-T_G = np.mean([x["gbuf"] for x in timing["frames"]])
-cams_base = {int(k): np.array(v) for k, v in json.load(open(f"{base}/cams.json")).items()}
+
+def set_overhead(t_full):
+    """Cost of one extra render call, expressed in 16-px tiles of path tracing (drives patch merging)."""
+    os.environ["KF_OVERHEAD_TILES"] = str(T_CALL / max(t_full, 1e-3) * (W * H) / 256)
+
+
+if HAVE_BASE:
+    set_overhead(np.mean([x["beauty"] for x in json.load(open(f"{base}/timing.json"))["frames"]]))
+t_setup = time.time() - T0
+print(f"{W}x{H}, frames {f0}-{f1}, setup {t_setup:.1f}s, call overhead {T_CALL:.3f}s, glossy objects {len(GLOSSY)}, "
+      f"mirror objects {len(MIRROR)}, moving objects {len(mov_idx)}, animated materials {list(amats)}", flush=True)
+
+timing = json.load(open(f"{base}/timing.json")) if HAVE_BASE else None
+if not REAL:
+    assert HAVE_BASE, "sim mode needs a baseline (run baseline.py first)"
+    T_FULL = np.mean([x["beauty"] for x in timing["frames"]])
+    T_G = np.mean([x["gbuf"] for x in timing["frames"]])
+    cams_base = {int(k): np.array(v) for k, v in json.load(open(f"{base}/cams.json")).items()}
 cost = dict(key=0.0, gbuf=0.0, residual=0.0, warp=0.0)
 calls = dict(key=0, gbuf=0, residual=0)
 res_pixels = 0
@@ -149,9 +203,34 @@ def intra_key(f, g):
     return img
 
 
+def turn_angle(i, a, b):
+    """Rotation (degrees) of moving object i between frames a and b."""
+    Ra, Rb = np.array(mov_idx[i][a - f0])[:3, :3], np.array(mov_idx[i][b - f0])[:3, :3]
+    Ra = Ra / np.linalg.norm(Ra, axis=0); Rb = Rb / np.linalg.norm(Rb, axis=0)
+    c = (np.trace(Ra.T @ Rb) - 1) / 2
+    return float(np.degrees(np.arccos(np.clip(c, -1, 1))))
+
+
+def must_split(a, b):
+    """Scene knowledge: if a visible moving object turns a lot between two keyframes, its shading and shadow can change
+    and come back (a cube turned 180 degrees looks the same), so the two keyframes may agree by coincidence.
+    Force a keyframe in between when any such object (>0.2% of the frame) turns more than MAX_ROT degrees."""
+    if not MAX_ROT or b - a < 3:
+        return False
+    for i in mov_idx:
+        area = max(float((keys[a].idx == i).mean()), float((keys[b].idx == i).mean()))
+        if area > 0.002 and turn_angle(i, a, b) > MAX_ROT:
+            return True
+    return False
+
+
 def known_dirty(t, a, b, g):
     """Scene knowledge the warp cannot see: animated material values (e.g. flashing bumpers) changing in (a, b)."""
     m = np.zeros((H, W), bool)
+    if len(DEFORM):
+        d = np.isin(g["idx"], DEFORM)
+        if d.any():
+            m |= cv2.dilate(d.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
     for name, vals in amats.items():
         va, vb, vt = vals[a - f0], vals[b - f0], vals[t - f0]
         if vt != va or vt != vb:
@@ -248,7 +327,10 @@ def finish(t, a, b, pred, dirty, g, stats):
 log = []
 keys = {}
 gcache = {}
-keys[f0] = make_key(f0); keys[f1] = make_key(f1)
+keys[f0] = make_key(f0)
+if not HAVE_BASE:
+    set_overhead(cost["key"])            # first keyframe = measured cost of a full frame
+keys[f1] = make_key(f1)
 log += [dict(frame=f0, key=True), dict(frame=f1, key=True)]
 stack = [(f0, f1)]
 while stack:
@@ -257,6 +339,12 @@ while stack:
         continue
     m = (a + b) // 2
     g, P = get_gbuf(m)
+    if must_split(a, b):
+        print(f"interval {a}-{b}: a moving object turns more than {MAX_ROT:g} degrees -> keyframe {m}", flush=True)
+        keys[m] = make_key(m, g, P)
+        log.append(dict(frame=m, key=True, reason="rotation"))
+        stack += [(a, m), (m, b)]
+        continue
     tw = time.time()
     pred, dirty, st = predict(m, keys[a], keys[b], g, P, mats_at(m), thr, known_dirty(m, a, b, g), GLOSSY, MIRROR)
     cost["warp"] += time.time() - tw
@@ -305,13 +393,42 @@ while stack:
 
 wall = time.time() - T0
 render_cost = cost["key"] + cost["gbuf"] + cost["residual"]
-summary = dict(scene=which, mode=mode, thr=thr, split=split, frames=f1 - f0 + 1,
+summary = dict(scene=which, mode=mode, thr=thr, split=split, frames=f1 - f0 + 1, first=f0, last=f1,
+               width=W, height=H, spp=sc.cycles.samples, blend=os.path.abspath(A.blend) if BLEND else None,
                keys=sorted(keys), n_keys=len(keys), calls=calls,
                cost={k: round(v, 1) for k, v in cost.items()}, render_cost=round(render_cost, 1),
                wall=round(wall, 1), setup=round(t_setup, 1),
-               baseline=timing["beauty_total"], speedup_render=round(timing["beauty_total"] / render_cost, 2),
+               baseline=timing["beauty_total"] if timing else None,
+               speedup_render=round(timing["beauty_total"] / render_cost, 2) if timing else None,
+               est_every_frame=round(cost["key"] / max(calls["key"], 1) * (f1 - f0 + 1), 1),
+               est_speedup=round(cost["key"] / max(calls["key"], 1) * (f1 - f0 + 1) / wall, 2),
+               warnings=WARN, deforming=[o.name for o in sc.objects if o.pass_index in set(DEFORM.tolist())],
                key_full_frac=key_full_frac,
                rendered_pixel_frac=round((len(keys) * W * H + res_pixels) / ((f1 - f0 + 1) * W * H), 3),
                log=sorted(log, key=lambda x: x["frame"]))
 json.dump(summary, open(f"{out}/summary.json", "w"), indent=1)
 print("SUMMARY", json.dumps({k: v for k, v in summary.items() if k != "log"}), flush=True)
+
+if BLEND:
+    # display-ready frames with the scene's own colour management, plus an mp4
+    os.makedirs(f"{out}/frames", exist_ok=True)
+    import bpy
+    ims = sc.render.image_settings
+    if hasattr(ims, "media_type"):
+        ims.media_type = "IMAGE"
+    ims.file_format = "PNG"; ims.color_depth = "8"; ims.color_mode = "RGB"
+    for f in range(f0, f1 + 1):
+        im = bpy.data.images.load(f"{out}/f_{f:04d}.exr")
+        im.colorspace_settings.name = "Linear Rec.709"
+        im.save_render(f"{out}/frames/{f:04d}.png", scene=sc)
+        bpy.data.images.remove(im)
+    if not A.no_video:
+        fps = sc.render.fps / sc.render.fps_base
+        mp4 = f"{out}/{which}.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", f"{fps:g}", "-start_number", str(f0),
+                        "-i", f"{out}/frames/%04d.png", "-c:v", "libx264", "-crf", "17", "-preset", "medium",
+                        "-pix_fmt", "yuv420p", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", mp4 + ".tmp.mp4"], check=True)
+        os.replace(mp4 + ".tmp.mp4", mp4)
+        print("VIDEO", mp4, flush=True)
+    print(f"DONE {f1 - f0 + 1} frames in {wall:.0f} s; rendering every frame would take about "
+          f"{summary['est_every_frame']:.0f} s (est. {summary['est_speedup']}x). Check the result with check.py.", flush=True)

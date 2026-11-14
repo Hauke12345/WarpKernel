@@ -82,7 +82,38 @@ glossy surfaces seen by only one keyframe.
   patching, so the total time was unchanged, and slight artifacts remained. The code is kept in `warpkernel/intra.py`
   (`KF_INTRA=1`).
 
-## Running it
+## Use it on your own animation
+
+```bash
+pip install -r requirements.txt
+python3 warpkernel/render.py --blend my_scene.blend --out out/my_scene     # -> frames/*.png + my_scene.mp4
+python3 warpkernel/check.py  --run out/my_scene                              # reference frames + crops to look at
+```
+
+`render.py --blend` takes resolution, frame range, samples and colour management from the file. It warns about what it
+can't reproduce (depth of field, motion blur, compositor effects) and switches it off. Objects that change shape
+(armatures, shape keys, simulations, animated modifiers) are found automatically and re-rendered every frame.
+When a visible object turns more than 45° between two keyframes (`--max-rot`), a keyframe is added in between,
+because two keyframes can agree by coincidence (a cube turned 180° looks the same).
+
+`check.py` renders a few reference frames the normal way and writes side-by-side comparisons plus enlarged crops of
+the worst areas. Look at them: the method's failure modes are easier to see than to measure.
+
+Try it on the example scene first:
+
+```bash
+python3 examples/make_example.py examples/example.blend
+python3 warpkernel/render.py --blend examples/example.blend --out out/example
+python3 warpkernel/check.py --run out/example
+```
+
+On the example (640×360, 48 frames: a rotating cube, a chrome sphere, a wobbling cylinder) this took 65 s instead of
+an estimated 140 s, with 46–48 dB PSNR against reference frames.
+
+Working with Claude: [`CLAUDE.md`](CLAUDE.md) holds the workflow and the rules (check by eye, don't trust agreeing
+keyframes), so a Claude Code session in this repository can render someone's .blend with it.
+
+## Running the benchmark
 
 Requirements: Python 3.13 with Blender as a Python module (`bpy`, tested with 5.3), see `requirements.txt`.
 
@@ -109,7 +140,8 @@ Main files:
 |---|---|
 | `warpkernel/scenes.py` | loads a test scene, reference lighting, Cycles setup, view layers (Beauty + geometry pass) |
 | `warpkernel/warp.py` | reprojection kernel, prediction, dirty rectangles, patch cache, rate model |
-| `warpkernel/render.py` | keyframes, bisection, patch rendering, cost accounting |
+| `warpkernel/render.py` | entry point (`--blend` for any file): keyframes, bisection, patch rendering, output |
+| `warpkernel/check.py` | reference frames, comparison images and crops for checking by eye |
 | `warpkernel/common.py` | render / EXR helpers |
 | `warpkernel/intra.py` | the dropped intra-frame experiment |
 

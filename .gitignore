@@ -2,3 +2,5 @@ out/
 __pycache__/
 *.pyc
 *.exr
+examples/*.blend
+examples/*.blend1

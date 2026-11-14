@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Load one of the three test scenes with its reference lighting and a common Cycles setup for the
-keyframe-warp experiment.
+"""Scene loading and the common Cycles setup.
 
-    sc = load("interior" | "outdoor" | "marble")
+    sc = load("interior" | "outdoor" | "marble")       # one of the three procedural test scenes
+    sc, warnings = load_blend("my_scene.blend")         # any .blend (resolution from KF_W / KF_H, see render.py)
 
-Render setup: 960x540, Cycles CPU, 8 spp fixed + OIDN (fast prefilter), no DOF / motion blur / compositor.
+Render setup: Cycles CPU, fixed samples (8 for the test scenes, the file's own count for a .blend) + OIDN
+(fast prefilter), no DOF / motion blur / compositor.
 Two view layers:
   Beauty  combined (denoised) + object index        -> what the viewer sees
   GBuf    1 spp, no denoise, black emission override: position + object index only (cheap geometry pass)
@@ -19,9 +20,12 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = {"interior": os.path.join(_REPO, "scenes", "cosy_room.py"), "outdoor": os.path.join(_REPO, "scenes", "village_square.py"),
        "marble": os.path.join(_REPO, "scenes", "marble_coaster.py")}
 FRAMES = {"interior": (1, 60), "outdoor": (1, 60), "marble": (20, 79)}
-W = int(os.environ.get("KF_W", 960)); H = W * 9 // 16; SPP = 8
+W = int(os.environ.get("KF_W", 960)); H = int(os.environ.get("KF_H", W * 9 // 16)); SPP = 8
 S = W / 960                                  # scale factor relative to the 960x540 development setup
 ROOT = os.path.join(os.environ.get("WARPKERNEL_OUT", os.path.join(_REPO, "out")), f"{W}x{H}")
+DEFORM_MODS = {"ARMATURE", "CLOTH", "SOFT_BODY", "FLUID", "DYNAMIC_PAINT", "OCEAN", "WAVE", "NODES", "PARTICLE_SYSTEM",
+               "EXPLODE", "MESH_CACHE", "MESH_SEQUENCE_CACHE", "SURFACE_DEFORM", "MESH_DEFORM", "LATTICE", "HOOK",
+               "SIMPLE_DEFORM", "DISPLACE", "SHRINKWRAP", "WARP", "CAST", "CURVE"}
 
 
 def _aim(o, t):
@@ -82,12 +86,46 @@ def load(which):
     exec(open(SRC[which]).read(), {"__name__": "__kfwarp__"})
     sc = bpy.context.scene
     _lighting(which, sc)
+    return prepare(sc, SPP)
+
+
+def load_blend(path):
+    """Open a .blend (or use it if it is already open) and prepare it. Returns (scene, warnings)."""
+    if os.path.abspath(bpy.data.filepath or "") != os.path.abspath(path):
+        bpy.ops.wm.open_mainfile(filepath=path)
+    sc = bpy.context.scene
+    warn = []
+    if sc.camera is None:
+        raise RuntimeError("the scene has no active camera")
+    if sc.camera.data.dof.use_dof:
+        warn.append("depth of field is switched off (predicted frames cannot reproduce it)")
+    if sc.render.use_motion_blur:
+        warn.append("motion blur is switched off (predicted frames cannot reproduce it)")
+    ng = getattr(sc, "compositing_node_group", None) or (getattr(sc, "node_tree", None) if getattr(sc, "use_nodes", False) else None)
+    plain = {"R_LAYERS", "COMPOSITE", "GROUP_OUTPUT", "GROUP_INPUT", "VIEWER", "REROUTE", "FRAME"}
+    if sc.render.use_compositing and ng is not None and any(n.type not in plain for n in ng.nodes):
+        warn.append("compositor effects (glare, colour correction...) are not applied; output is the plain render with "
+                    "the scene's colour management")
+    w = sc.world
+    if w and w.node_tree and any(n.type == "OUTPUT_WORLD" and n.inputs["Volume"].links for n in w.node_tree.nodes):
+        warn.append("world volume (fog) found: it is view-dependent and will mostly be re-rendered, expect a low speed-up")
+    if any(m.node_tree and any(n.type == "OUTPUT_MATERIAL" and n.inputs["Volume"].links for n in m.node_tree.nodes)
+           for m in bpy.data.materials):
+        warn.append("volume materials found: their look is view-dependent, expect artifacts or re-rendering")
+    if sc.render.engine != "CYCLES":
+        warn.append(f"render engine was {sc.render.engine}, switched to Cycles")
+    spp = sc.cycles.samples if sc.render.engine == "CYCLES" else 64
+    return prepare(sc, spp), warn
+
+
+def prepare(sc, spp):
+    """Common setup: Cycles CPU, fixed seed and sample count, OIDN, Beauty + GBuf view layers, unique pass indices."""
     for o in list(bpy.data.objects):
         if o.type == "LIGHT_PROBE":
             bpy.data.objects.remove(o)
     sc.render.engine = "CYCLES"
     c = sc.cycles
-    c.device = "CPU"; c.samples = SPP; c.use_adaptive_sampling = False; c.time_limit = 0.0
+    c.device = "CPU"; c.samples = spp; c.use_adaptive_sampling = False; c.time_limit = 0.0
     c.use_denoising = True; c.denoiser = "OPENIMAGEDENOISE"
     c.denoising_input_passes = "RGB_ALBEDO_NORMAL"; c.denoising_prefilter = "FAST"
     c.use_animated_seed = False; c.seed = 0
@@ -105,7 +143,10 @@ def load(which):
 
     for i, o in enumerate(sorted(bpy.data.objects, key=lambda o: o.name)):
         o.pass_index = i + 1
-    vl = sc.view_layers[0]
+    vl = bpy.context.view_layer if bpy.context.view_layer in list(sc.view_layers) else sc.view_layers[0]
+    for v in list(sc.view_layers):
+        if v != vl:
+            sc.view_layers.remove(v)
     vl.name = "Beauty"
     vl.use_pass_combined = True; vl.use_pass_object_index = True; vl.use_pass_z = False
     g = sc.view_layers.new("GBuf")
@@ -123,7 +164,7 @@ def load(which):
 
 def animated_objects(sc, f0, f1):
     """Objects whose world matrix changes over [f0, f1] -> {name: [matrix per frame]} (camera included)."""
-    names = [o.name for o in sc.objects if o.type in ("MESH", "CURVE", "FONT", "SURFACE", "META", "CAMERA")]
+    names = [o.name for o in sc.objects if o.type in ("MESH", "CURVE", "CURVES", "FONT", "SURFACE", "META", "CAMERA", "POINTCLOUD")]
     mats = {n: [] for n in names}
     for f in range(f0, f1 + 1):
         sc.frame_set(f)
@@ -160,3 +201,42 @@ def animated_materials(sc, f0, f1):
 
 def objects_using(mat_name):
     return [o for o in bpy.data.objects if o.type == "MESH" and any(s.material and s.material.name == mat_name for s in o.material_slots)]
+
+
+def deforming_objects(sc, f0, f1, samples=4):
+    """Objects whose shape changes over [f0, f1] (armatures, shape keys, simulations, animated modifiers...).
+    Their motion is not rigid, so the warp cannot predict them: they are re-rendered in every frame.
+    Detected by comparing the evaluated geometry (object space) at a few frames."""
+    import numpy as np
+    cand = []
+    for o in sc.objects:
+        if o.type not in ("MESH", "CURVE", "FONT", "SURFACE", "META", "CURVES", "POINTCLOUD"):
+            continue
+        sk = getattr(o.data, "shape_keys", None)
+        if any(m.type in DEFORM_MODS for m in o.modifiers) or (sk and sk.animation_data) or o.particle_systems or \
+                (o.data and o.data.animation_data) or o.type in ("META", "CURVES", "POINTCLOUD"):
+            cand.append(o.name)
+    if not cand:
+        return []
+    frames = sorted({f0, f1, *[int(f0 + (f1 - f0) * k / (samples - 1)) for k in range(samples)]})
+
+    def sig(name):
+        dg = bpy.context.evaluated_depsgraph_get()
+        ob = sc.objects[name].evaluated_get(dg)
+        try:
+            me = ob.to_mesh()
+        except RuntimeError:
+            return None
+        n = len(me.vertices)
+        co = np.zeros(n * 3, np.float32)
+        if n:
+            me.vertices.foreach_get("co", co)
+        ob.to_mesh_clear()
+        inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.name == name)
+        return n, inst, co[::max(1, n // 2000) * 3].round(4).tobytes() if n else b""
+    sigs = {n: [] for n in cand}
+    for f in frames:
+        sc.frame_set(f)
+        for n in cand:
+            sigs[n].append(sig(n))
+    return [n for n, ss in sigs.items() if any(s_ != ss[0] for s_ in ss[1:])]
